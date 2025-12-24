@@ -8,14 +8,24 @@ import { v4 as uuidv4 } from "uuid";
 const app = express();
 app.use(express.json({ limit: "1mb" }));
 
-const TMP_DIR = path.resolve("tmp");
+/**
+ * Directory structure
+ */
+const ROOT_DIR = process.cwd();
+const TMP_DIR = path.join(ROOT_DIR, "tmp");
 const CLIPS_DIR = path.join(TMP_DIR, "clips");
 const OUTPUT_DIR = path.join(TMP_DIR, "output");
+const PERMANENT_DIR = path.join(ROOT_DIR, "merged_videos");
 
-// Ensure temp directories exist
-fs.mkdirSync(CLIPS_DIR, { recursive: true });
-fs.mkdirSync(OUTPUT_DIR, { recursive: true });
+// Ensure directories exist
+[CLIPS_DIR, OUTPUT_DIR, PERMANENT_DIR].forEach(dir => {
+  fs.mkdirSync(dir, { recursive: true });
+});
 
+/**
+ * POST /merge
+ * Body: { clips: string[] }
+ */
 app.post("/merge", async (req, res) => {
   const { clips } = req.body;
 
@@ -35,12 +45,18 @@ app.post("/merge", async (req, res) => {
   fs.mkdirSync(sessionOutputDir, { recursive: true });
 
   try {
-    // 1️⃣ Download all clips
+    console.log(`[MERGE] Session ${sessionId} started with ${clips.length} clips`);
+
+    /**
+     * 1️⃣ Download clips
+     */
     const clipPaths = [];
 
     for (let i = 0; i < clips.length; i++) {
       const clipUrl = clips[i];
       const clipPath = path.join(sessionClipDir, `clip_${i}.mp4`);
+
+      console.log(`[MERGE] Downloading clip ${i + 1}`);
 
       const response = await axios.get(clipUrl, { responseType: "stream" });
       const writer = fs.createWriteStream(clipPath);
@@ -54,7 +70,9 @@ app.post("/merge", async (req, res) => {
       clipPaths.push(clipPath);
     }
 
-    // 2️⃣ Create FFmpeg concat file
+    /**
+     * 2️⃣ Create concat.txt
+     */
     const concatFilePath = path.join(sessionClipDir, "concat.txt");
     const concatFileContent = clipPaths
       .map(p => `file '${p.replace(/'/g, "'\\''")}'`)
@@ -62,40 +80,73 @@ app.post("/merge", async (req, res) => {
 
     fs.writeFileSync(concatFilePath, concatFileContent);
 
-    // 3️⃣ Run FFmpeg merge
-    const outputFilePath = path.join(sessionOutputDir, "merged.mp4");
+    /**
+     * 3️⃣ Run FFmpeg merge (RE-ENCODED for correctness)
+     */
+    const tempOutputPath = path.join(sessionOutputDir, "merged.mp4");
 
-    const ffmpegCommand = `ffmpeg -y -f concat -safe 0 -i "${concatFilePath}" -c copy "${outputFilePath}"`;
+    const ffmpegCommand =
+      `ffmpeg -y -f concat -safe 0 -i "${concatFilePath}" ` +
+      `-c:v libx264 -preset fast -crf 18 ` +
+      `-c:a aac -b:a 192k ` +
+      `-movflags +faststart "${tempOutputPath}"`;
+
+    console.log("[MERGE] Running FFmpeg...");
+    console.log(ffmpegCommand);
 
     exec(ffmpegCommand, (error) => {
       if (error) {
-        console.error("FFmpeg error:", error);
+        console.error("[MERGE] FFmpeg failed:", error);
         return res.status(500).json({ error: "Video merge failed" });
       }
 
-      // 4️⃣ Stream video back to client
+      if (!fs.existsSync(tempOutputPath)) {
+        console.error("[MERGE] Output file not found");
+        return res.status(500).json({ error: "FFmpeg did not produce output file" });
+      }
+
+      /**
+       * 4️⃣ Save merged video permanently (debug)
+       */
+      const finalOutputPath = path.join(
+        PERMANENT_DIR,
+        `merged-${sessionId}.mp4`
+      );
+
+      fs.copyFileSync(tempOutputPath, finalOutputPath);
+      console.log("[MERGE] Saved merged video:", finalOutputPath);
+
+      /**
+       * 5️⃣ Stream merged video back to client
+       */
       res.setHeader("Content-Type", "video/mp4");
       res.setHeader("Content-Disposition", "inline; filename=merged.mp4");
 
-      const readStream = fs.createReadStream(outputFilePath);
+      const readStream = fs.createReadStream(tempOutputPath);
       readStream.pipe(res);
 
-      // 5️⃣ Cleanup after response finishes
+      /**
+       * 6️⃣ Cleanup temp files after response
+       */
       res.on("finish", () => {
         fs.rmSync(sessionClipDir, { recursive: true, force: true });
         fs.rmSync(sessionOutputDir, { recursive: true, force: true });
+        console.log("[MERGE] Cleaned temp files for", sessionId);
       });
     });
 
   } catch (err) {
-    console.error("Merge error:", err);
+    console.error("[MERGE] Unexpected error:", err);
     fs.rmSync(sessionClipDir, { recursive: true, force: true });
     fs.rmSync(sessionOutputDir, { recursive: true, force: true });
     res.status(500).json({ error: "Unexpected server error" });
   }
 });
 
+/**
+ * Server start
+ */
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`Video merge service running on port ${PORT}`);
+  console.log(`✅ Video merge service running on port ${PORT}`);
 });
